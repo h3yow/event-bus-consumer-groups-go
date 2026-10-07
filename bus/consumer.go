@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -70,11 +71,27 @@ type Consumer struct {
 	stopOnce sync.Once
 	stopCh   chan struct{}
 	doneCh   chan struct{}
+
+	// running is 1 from the first Run until all partition loops exit. It
+	// lets Shutdown distinguish "group never started / already stopped"
+	// from a group whose handler is still executing.
+	running atomic.Bool
+	// ran is set true once Run has ever been entered (never reset), so the
+	// shutdown report can label a never-run group even long after it stops.
+	ran atomic.Bool
+	// inFlight marks partitions currently inside Handler.Handle (set right
+	// before the call, cleared right after). Used by the shutdown report
+	// to label a group whose handler did not return within the grace.
+	inFlight sync.Map // partition int -> *atomic.Bool
 }
 
 // Run starts one delivery loop per partition and blocks until Stop, ctx
-// cancellation or bus close.
+// cancellation or the bus shutdown drain-window deadline.
 func (c *Consumer) Run(ctx context.Context) error {
+	c.running.Store(true)
+	c.ran.Store(true)
+	defer c.running.Store(false)
+
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -82,7 +99,9 @@ func (c *Consumer) Run(ctx context.Context) error {
 		select {
 		case <-c.stopCh:
 			cancel()
-		case <-c.bus.closeCh:
+		case <-c.bus.deadlineCh:
+			// Drain window over: stop taking/finishing work. The commit
+			// fence prevents any storage write after this point.
 			cancel()
 		case <-runCtx.Done():
 		}
@@ -152,7 +171,22 @@ func (c *Consumer) deliverWithRetry(ctx context.Context, msg Message) bool {
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		msg.Attempt = attempt
+		// The drain window may have ended during the retry backoff: do not
+		// start another attempt, and never touch storage afterwards.
+		if c.bus.fenced() {
+			return false
+		}
+		c.markInflight(msg.Partition, true)
 		err := c.handler.Handle(ctx, msg)
+		c.markInflight(msg.Partition, false)
+		// If the drain window ended while the handler ran, the result must
+		// never be committed: after shutdown, storage is being released.
+		// The message stays uncommitted and is redelivered next start.
+		if c.bus.fenced() {
+			c.logf("group=%s id=%s partition=%d offset=%d FENCED after attempt=%d: result discarded, redelivery on restart",
+				c.groupID, msg.ID, msg.Partition, msg.Offset, attempt)
+			return false
+		}
 		if err == nil {
 			if commitErr := c.commitOnce(msg); commitErr != nil {
 				// Commit failure is fatal for the process: the handler
@@ -198,7 +232,7 @@ func (c *Consumer) deliverWithRetry(ctx context.Context, msg Message) bool {
 		case <-ctx.Done():
 			t.Stop()
 			return false
-		case <-c.bus.closeCh:
+		case <-c.bus.deadlineCh:
 			t.Stop()
 			return false
 		case <-t.C:
@@ -211,6 +245,11 @@ func (c *Consumer) deliverWithRetry(ctx context.Context, msg Message) bool {
 // commitOnce validates and persists the commit for msg. Ordering and
 // duplicates are rejected explicitly rather than silently accepted.
 func (c *Consumer) commitOnce(msg Message) error {
+	// Hard fence: once the drain window is over (plus grace), no commit is
+	// accepted, so storage can never be written after release.
+	if c.bus.fenced() {
+		return ErrShutdownFenced
+	}
 	c.ackMu.Lock()
 	defer c.ackMu.Unlock()
 
@@ -232,10 +271,17 @@ func (c *Consumer) commitOnce(msg Message) error {
 	// Advancing any watermark may free capacity in the bounded partition:
 	// wake a publisher blocked in WaitRoom.
 	c.bus.partitions[msg.Partition].Notify()
+	// Also wake a graceful shutdown waiting for full drain.
+	c.bus.notifyDrain()
 	return nil
 }
 
 func (c *Consumer) deadLetter(msg Message, reason RejectReason, cause error, attempt int) {
+	if c.bus.fenced() {
+		// Shutdown over: never touch DLQ storage; the head message will be
+		// retried/DLQ'd again on the next start.
+		return
+	}
 	entry := DLQEntry{
 		GroupID:  c.groupID,
 		Message:  msg,
@@ -298,5 +344,56 @@ func (c *Consumer) DLQEntries() ([]DLQEntry, error) {
 func (c *Consumer) logf(format string, args ...any) {
 	if c.cfg.Logger != nil {
 		c.cfg.Logger.Printf(format, args...)
+	}
+}
+
+// markInflight flags (or clears) that a partition is inside Handle.
+func (c *Consumer) markInflight(partition int, active bool) {
+	v, _ := c.inFlight.LoadOrStore(partition, &atomic.Bool{})
+	v.(*atomic.Bool).Store(active)
+}
+
+// inflight reports whether the group has a handler executing on partition
+// (-1 = any partition).
+func (c *Consumer) inflight(partition int) bool {
+	found := false
+	c.inFlight.Range(func(k, v any) bool {
+		if partition < 0 || k.(int) == partition {
+			if v.(*atomic.Bool).Load() {
+				found = true
+				return false
+			}
+		}
+		return true
+	})
+	return found
+}
+
+// isRunning reports whether a Run loop is (or was recently) active.
+func (c *Consumer) isRunning() bool { return c.running.Load() }
+
+// ranEver reports whether Run was invoked at least once on this consumer.
+func (c *Consumer) ranEver() bool { return c.ran.Load() }
+
+// requestStop is the idempotent stop used by the bus shutdown.
+func (c *Consumer) requestStop() { c.stopOnce.Do(func() { close(c.stopCh) }) }
+
+// waitDone blocks until all delivery loops have exited. It returns true
+// immediately when the consumer never ran (doneCh is only closed by Run).
+func (c *Consumer) waitDone(timeout time.Duration) bool {
+	if !c.isRunning() {
+		return true
+	}
+	if timeout <= 0 {
+		<-c.doneCh
+		return true
+	}
+	t := time.NewTimer(timeout)
+	defer t.Stop()
+	select {
+	case <-c.doneCh:
+		return true
+	case <-t.C:
+		return false
 	}
 }

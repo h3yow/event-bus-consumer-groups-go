@@ -101,6 +101,10 @@ type PartitionLog struct {
 	// signal is closed and replaced whenever appends happen or the log closes,
 	// waking blocked publishers/feeders (channel broadcast idiom).
 	signal chan struct{}
+	// sealed rejects new appends as soon as shutdown starts (distinct from
+	// closed, which also stops consumers waiting on WaitOffset). Sealing
+	// only blocks publishers; readers keep draining the backlog.
+	sealed bool
 	closed bool
 	wal    *WAL
 
@@ -159,13 +163,13 @@ func (p *PartitionLog) fullLocked() bool {
 func (p *PartitionLog) WaitRoom(ctx context.Context) error {
 	for {
 		p.mu.Lock()
-		full, closed := p.fullLocked(), p.closed
+		full, closed, sealed := p.fullLocked(), p.closed, p.sealed
 		ch := p.signal
 		p.mu.Unlock()
-		if !full {
+		if !full && !sealed {
 			return nil
 		}
-		if closed {
+		if sealed || closed {
 			return ErrBusClosed
 		}
 		select {
@@ -206,7 +210,7 @@ func (p *PartitionLog) WaitOffset(ctx context.Context, offset int64) error {
 // ErrBusClosed after close.
 func (p *PartitionLog) TryAppend(m Message) (Message, error) {
 	p.mu.Lock()
-	if p.closed {
+	if p.closed || p.sealed {
 		p.mu.Unlock()
 		return Message{}, ErrBusClosed
 	}
@@ -241,6 +245,19 @@ func (p *PartitionLog) Get(offset int64) (Message, bool) {
 		return Message{}, false
 	}
 	return p.records[offset], true
+}
+
+// seal rejects new appends (and wakes publishers parked in WaitRoom) but
+// leaves WaitOffset readers running so consumers can drain.
+func (p *PartitionLog) seal() {
+	p.mu.Lock()
+	if !p.sealed {
+		p.sealed = true
+		ch := p.signal
+		p.signal = make(chan struct{})
+		close(ch)
+	}
+	p.mu.Unlock()
 }
 
 // close marks the log closed and wakes every waiter.

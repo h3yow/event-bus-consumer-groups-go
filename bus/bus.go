@@ -4,10 +4,18 @@ import (
 	"context"
 	"errors"
 	"hash/fnv"
+	"log"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
+)
+
+// Bus lifecycle states.
+const (
+	stateOpen     uint32 = iota // accepting publishes and subscriptions
+	stateDraining               // Shutdown started: new work refused, drain in progress
+	stateClosed                 // shutdown finished: storage released
 )
 
 // Config holds bus-level configuration.
@@ -25,6 +33,16 @@ type Config struct {
 	BlockPublish bool
 	// PublishTimeout bounds blocking publishes; zero means wait forever.
 	PublishTimeout time.Duration
+	// ShutdownTimeout is the default drain window for Shutdown: time given
+	// to in-flight handlers, retry backoffs and uncommitted messages to
+	// finish. Zero defaults to 5s.
+	ShutdownTimeout time.Duration
+	// StopGrace bounds how long Shutdown waits, after the drain window,
+	// for a handler currently executing to return before fencing its
+	// commit. Zero defaults to 250ms.
+	StopGrace time.Duration
+	// Logger, when set, receives shutdown lifecycle log lines.
+	Logger *log.Logger
 }
 
 // DefaultConfig returns sensible defaults.
@@ -46,9 +64,17 @@ type Bus struct {
 	groups     map[string]*Consumer
 	offsets    *OffsetStore
 	dlq        *DLQ
-	closed     bool
-	closeCh    chan struct{}
-	rrCounter  atomic.Uint64
+
+	// Lifecycle state machine: stateOpen -> stateDraining -> stateClosed.
+	state        atomic.Uint32
+	drainCh      chan struct{}                 // closed once when draining starts
+	deadlineCh   chan struct{}                 // closed once when the drain window ends
+	closeCh      chan struct{}                 // closed once after storage is released
+	drainNotify  atomic.Pointer[chan struct{}] // broadcast: swapped on every commit during drain
+	deadlineOnce sync.Once
+	report       *ShutdownReport // populated before closeCh is closed
+
+	rrCounter atomic.Uint64
 }
 
 // New creates and recovers a Bus from DataDir. WALs and committed offsets
@@ -71,11 +97,17 @@ func New(cfg Config) (*Bus, error) {
 		return nil, err
 	}
 	b := &Bus{
-		cfg:     cfg,
-		groups:  map[string]*Consumer{},
-		offsets: offsets,
-		dlq:     dlq,
-		closeCh: make(chan struct{}),
+		cfg:        cfg,
+		groups:     map[string]*Consumer{},
+		offsets:    offsets,
+		dlq:        dlq,
+		drainCh:    make(chan struct{}),
+		deadlineCh: make(chan struct{}),
+		closeCh:    make(chan struct{}),
+	}
+	{
+		ch := make(chan struct{})
+		b.drainNotify.Store(&ch)
 	}
 	for i := 0; i < cfg.Partitions; i++ {
 		w, replay, err := OpenWAL(cfg.DataDir, i)
@@ -90,6 +122,9 @@ func New(cfg Config) (*Bus, error) {
 		b.partitions = append(b.partitions, p)
 		b.wals = append(b.wals, w)
 	}
+	// Surface the previous run's shutdown report (if any) so post-restart
+	// queries match the persisted offsets/DLQ.
+	b.report = b.loadLastReport()
 	return b, nil
 }
 
@@ -131,6 +166,11 @@ func (b *Bus) Publish(key, id string, payload []byte) (int, int64, error) {
 	p := b.partitions[part]
 	msg := Message{ID: id, Key: key, Payload: payload}
 
+	// First gate: once draining/closed, new messages are never accepted.
+	if s := b.state.Load(); s != stateOpen {
+		return 0, 0, b.refuseError(s)
+	}
+
 	// blocking: park in WaitRoom until capacity frees.
 	if b.cfg.BlockPublish {
 		ctx := context.Background()
@@ -143,17 +183,15 @@ func (b *Bus) Publish(key, id string, payload []byte) (int, int64, error) {
 		defer cancel()
 		go func() {
 			select {
-			case <-b.closeCh:
+			case <-b.drainCh:
 				cancel()
 			case <-ctx.Done():
 			}
 		}()
 		if err := p.WaitRoom(ctx); err != nil {
-			b.mu.RLock()
-			closed := b.closed
-			b.mu.RUnlock()
-			if closed || errors.Is(err, ErrBusClosed) {
-				return 0, 0, ErrBusClosed
+			s := b.state.Load()
+			if s != stateOpen || errors.Is(err, ErrBusClosed) {
+				return 0, 0, b.refuseError(s)
 			}
 			if b.cfg.PublishTimeout > 0 {
 				return 0, 0, ErrQueueFull
@@ -162,11 +200,53 @@ func (b *Bus) Publish(key, id string, payload []byte) (int, int64, error) {
 		}
 	}
 
+	// Second gate: shutdown may have started while we parked (blocking) or
+	// even between the first gate and append (non-blocking). Returning an
+	// error here never loses data: this publisher had not appended yet.
+	if s := b.state.Load(); s != stateOpen {
+		return 0, 0, b.refuseError(s)
+	}
+
 	stored, err := p.TryAppend(msg)
 	if err != nil {
+		if errors.Is(err, ErrBusClosed) {
+			return 0, 0, b.refuseError(b.state.Load())
+		}
 		return 0, 0, err
 	}
 	return part, stored.Offset, nil
+}
+
+// refuseError maps a lifecycle state to the stable error a Publish or
+// Subscribe caller observes after shutdown has started.
+func (b *Bus) refuseError(s uint32) error {
+	if s == stateClosed {
+		return &BusClosedError{Stage: stageClosed}
+	}
+	return &BusClosedError{Stage: stageDraining}
+}
+
+// fenced reports whether the drain window is over: after this point no
+// commit or DLQ write may touch storage.
+func (b *Bus) fenced() bool {
+	select {
+	case <-b.deadlineCh:
+		return true
+	default:
+		return false
+	}
+}
+
+// drainSignal returns a channel that is closed (and atomically replaced)
+// whenever a commit might have moved a group closer to fully drained,
+// letting Shutdown wake early. Both read and swap are atomic, so the
+// commit path needs no bus.mu (avoids an ackMu -> bus.mu lock edge).
+func (b *Bus) drainSignal() <-chan struct{} { return *b.drainNotify.Load() }
+
+func (b *Bus) notifyDrain() {
+	next := make(chan struct{})
+	old := b.drainNotify.Swap(&next)
+	close(*old)
 }
 
 // Subscribe registers a consumer group with the given handler and options.
@@ -175,8 +255,8 @@ func (b *Bus) Publish(key, id string, payload []byte) (int, int64, error) {
 func (b *Bus) Subscribe(groupID string, h Handler, opts ...ConsumerOption) (*Consumer, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.closed {
-		return nil, ErrBusClosed
+	if s := b.state.Load(); s != stateOpen {
+		return nil, b.refuseError(s)
 	}
 	if _, exists := b.groups[groupID]; exists {
 		return nil, &groupExistsError{group: groupID}
@@ -210,22 +290,12 @@ func (e *groupExistsError) Error() string {
 // DLQEntries returns every dead-letter entry across all groups.
 func (b *Bus) DLQEntries() ([]DLQEntry, error) { return b.dlq.Entries() }
 
-// Close stops accepting publishes, wakes all blocked publishers and
-// closes every storage handle. Consumers must be stopped separately
-// before Close to finish in-flight work.
+// Close is the legacy hard-stop: it is equivalent to Shutdown with no
+// drain window, which unblocks publishers/consumers and releases storage
+// immediately. Prefer Shutdown for the unified graceful shutdown.
 func (b *Bus) Close() error {
-	b.mu.Lock()
-	if b.closed {
-		b.mu.Unlock()
-		return ErrBusClosed
-	}
-	b.closed = true
-	close(b.closeCh)
-	for _, p := range b.partitions {
-		p.close()
-	}
-	b.mu.Unlock()
-	return b.closeStorage()
+	_, err := b.shutdown(0, 0)
+	return err
 }
 
 func (b *Bus) closeStorage() error {

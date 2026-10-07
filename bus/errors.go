@@ -18,7 +18,46 @@ var (
 	ErrOutOfOrderAck = errors.New("bus: ack rejected: offset gap, earlier messages are not committed")
 	// ErrUnknownGroup is returned when a group has no subscription/state.
 	ErrUnknownGroup = errors.New("bus: unknown consumer group")
+	// ErrBusShuttingDown is returned by Publish/Subscribe while a graceful
+	// shutdown is draining, before storage is fully closed. It wraps
+	// ErrBusClosed, so errors.Is(err, ErrBusClosed) still matches; match
+	// this sentinel to distinguish "refused during drain" from "already
+	// fully closed" (plain ErrBusClosed).
+	ErrBusShuttingDown = errors.New("bus: shutdown in progress, refusing new work")
+	// ErrShutdownFenced is returned when a commit/DLQ write is attempted
+	// after the drain window closed. The write is refused so storage is
+	// never touched after release; the message stays uncommitted and is
+	// redelivered on the next start.
+	ErrShutdownFenced = errors.New("bus: shutdown fence reached, commit refused; message will be redelivered")
 )
+
+// BusClosedError wraps ErrBusClosed with a stable, distinguishable stage:
+// "draining" (graceful shutdown started, new work refused) or "closed"
+// (shutdown finished and storage released).
+type BusClosedError struct {
+	Stage string
+}
+
+func (e *BusClosedError) Error() string {
+	switch e.Stage {
+	case stageDraining:
+		return ErrBusShuttingDown.Error()
+	default:
+		return ErrBusClosed.Error()
+	}
+}
+
+// Is makes both stages match ErrBusClosed and the draining stage also
+// match ErrBusShuttingDown.
+func (e *BusClosedError) Is(target error) bool {
+	if target == ErrBusClosed {
+		return true
+	}
+	if e.Stage == stageDraining && target == ErrBusShuttingDown {
+		return true
+	}
+	return false
+}
 
 // RejectReason distinguishes why a message entered the dead-letter queue.
 type RejectReason string

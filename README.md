@@ -93,6 +93,100 @@ go c1.Run(context.Background()) // 阻塞运行；c1.Stop() 优雅停止
 
 ---
 
+## 4.5 统一优雅停机（Graceful Shutdown）
+
+`Bus.Shutdown(...)` 把"逐个停消费组 + 关总线"合并为**一个有界、可预期、可解释**的动作，替代手工编排。
+
+### 停机时序与语义
+
+1. **立即停止接收新工作**：状态从 `open` 切到 `draining`，此后 `Publish` / `Subscribe` 立即被拒绝；因队列满而阻塞在 `WaitRoom` 的生产者被立刻唤醒。
+2. **排空窗口（drain window）**：给"正在执行的 handler、退避重试中的消息、尚未确认的积压"一段可配置时间继续收尾。窗口内成功的处理照常提交并 fsync 持久化；一旦所有运行中的组把每个分区都追到日志末端，**提前结束**，不必等满窗口。
+3. **截止围栏（fence）**：窗口结束即关闭 deadline，投递循环被取消，重试等待被打断；此后任何 `Commit` / DLQ 写入都被硬围栏拒绝（`ErrShutdownFenced`）——**存储释放后绝不可能再被写入**。
+4. **停止宽限（stop grace）**：窗口结束瞬间仍在 handler 里的调用，再给一个很短的有界宽限等待其返回；超时也不影响停机按时结束（其结果会被围栏丢弃）。
+5. 关闭分区日志、释放 WAL/DLQ/offset 句柄，并把停机报告**原子持久化**到 `DataDir/shutdown.json`。
+
+**确认语义不被破坏**：
+
+- 已确认位点只能**保持或前进**（沿用 `OffsetStore` 的单调校验，回退一律拒绝）。
+- 窗口结束时仍未确认的消息**不提交**，下次启动从旧位点重新投递（at-least-once）。
+- 同一消费组同一条消息不会出现两次成功确认：窗口后的"迟到成功"被围栏挡下，位点不动，重启只再投一次。
+- 阻塞中的生产者要么在围栏前进了容量并成功落 WAL（消息不丢），要么收到明确的拒绝错误自行重试——**不存在静默丢失**。
+
+### 停机后的稳定、可区分原因
+
+| 调用时机 | 返回错误 |
+|---|---|
+| 排空中（`draining`） | `*BusClosedError{Stage:"draining"}`，同时 `errors.Is(err, bus.ErrBusShuttingDown)` 和 `errors.Is(err, bus.ErrBusClosed)` 都为真 |
+| 停机完成后（`closed`） | `*BusClosedError{Stage:"closed"}`，只匹配 `bus.ErrBusClosed`，**不**匹配 `ErrBusShuttingDown` |
+
+因此调用方既能用 `ErrBusClosed` 统一判断"总线不再可用"，也能用 `ErrBusShuttingDown` 区分"排空阶段被拒"与"已彻底关闭"。
+
+**并发与重复调用安全幂等**：多个 goroutine 同时调用 `Shutdown`、或对已停机的总线重复调用，都安全。只有第一个调用执行编排，其余调用等待结束并拿到**同一份内容**的报告（副本），且不返回错误。停机一定在 `DrainTimeout + StopGrace`（加少量调度余量）内返回，不会无限等待退避重试或卡死的生产者/handler。
+
+### 停机报告（ShutdownReport）
+
+按**消费组 × 分区**列出停机时刻的可解释结果，全部数字在循环静止后从已持久化状态读取，与 `offsets.json` / `dlq.log` 一致；**重启后用 `bus.LastShutdownReport()` 再查也不会自相矛盾**。
+
+```go
+rep, err := b.Shutdown(
+    bus.WithDrainTimeout(5*time.Second),
+    bus.WithStopGrace(250*time.Millisecond),
+)
+// rep.Outcome: "drained"（窗口内全部收尾）或 "timeout"（有未排空工作）
+// rep.Reason : 总线级中断原因
+for _, g := range rep.Groups {
+    // g.Outcome / g.Reason / g.Pending / g.NewDLQ
+    for _, p := range g.Partitions {
+        // p.Partition / p.CommittedNext / p.LogEndOffset / p.Pending / p.NewDLQ
+        // p.InterruptReason
+    }
+}
+```
+
+字段含义：
+
+| 字段 | 含义 |
+|---|---|
+| `CommittedNext` | 该组该分区已持久化的"下一条待消费"位点 |
+| `LogEndOffset` | 分区 WAL 当前日志末端 |
+| `Pending` | 未排空消息数 = `LogEndOffset - CommittedNext`（重启后重新投递） |
+| `NewDLQ` | 本次停机窗口内**新增**的死信条数（已持久化、位点已推进） |
+| `InterruptReason` | `drained` / `drain_timeout`（在重试/追赶但超时）/ `handler_stuck`（宽限结束 handler 仍未返回）/ `not_running`（订阅了但没在跑） |
+
+报告示例（一个分区排空、一个分区在重试中被中断）：
+
+```json
+{
+  "outcome": "timeout",
+  "reason": "drain_timeout",
+  "groups": [
+    {"group_id": "g", "outcome": "interrupted", "pending": 1, "new_dlq": 0, "reason": "drain_timeout",
+     "partitions": [
+       {"partition": 0, "committed_next": 5, "log_end_offset": 5, "pending": 0, "new_dlq": 0},
+       {"partition": 1, "committed_next": 3, "log_end_offset": 4, "pending": 1, "new_dlq": 0,
+        "interrupt_reason": "drain_timeout"}
+     ]}
+  ]
+}
+```
+
+### 配置项
+
+| 配置 | 默认 | 说明 |
+|---|---|---|
+| `Config.ShutdownTimeout` | `5s` | 默认排空窗口；可用 `WithDrainTimeout` 按次覆盖 |
+| `Config.StopGrace` | `250ms` | 窗口结束后等待在途 handler 返回的宽限；可用 `WithStopGrace` 覆盖 |
+| `Config.Logger` | 标准 logger | 记录停机生命周期与围栏事件（消息 ID/分区/位点） |
+
+### 与旧的"逐个停消费组"方式的兼容范围
+
+- `Consumer.Stop()` / `Consumer.Wait()` / `ctx` 取消**仍然保留且语义不变**，可以继续单独使用；你仍可先手工停各组再 `Close`。
+- `Bus.Close()` 现在等价于 `Shutdown` 的**零排空窗口**形态（立即围栏、释放存储），保持原有"硬关闭"语义；旧代码无需改动。
+- 新代码推荐统一调用一次 `Shutdown`：它内部会停止所有组、等待有界宽限、落盘报告并关闭总线，**不要**在 `Shutdown` 之后再调用 `Close`（幂等，直接返回缓存报告）。
+- 建议：handler 尽量响应传入的 `ctx`（停机截止会取消它），以获得更快、更干净的排空；不响应 ctx 的 handler 由 `StopGrace` 兜底，不会拖死停机。
+
+---
+
 ## 5. 故障恢复（Recovery）
 
 `DataDir` 下有三类持久化文件，`bus.New` 启动时统一重放：
@@ -101,7 +195,8 @@ go c1.Run(context.Background()) // 阻塞运行；c1.Stop() 优雅停止
 busdata/
 ├── partition-0.wal ... partition-N.wal  # 每分区消息 WAL（JSON-lines，逐条 fsync）
 ├── offsets.json                         # 消费组位点（原子快照：tmp + fsync + rename）
-└── dlq.log                              # 死信记录（JSON-lines，逐条 fsync）
+├── dlq.log                              # 死信记录（JSON-lines，逐条 fsync）
+└── shutdown.json                        # 最近一次优雅停机报告（原子快照，可跨重启查询）
 ```
 
 规则：
@@ -132,6 +227,9 @@ busdata/
 | `QueueCapacity` | `1024` | 每分区按最慢组计算的积压上限；`0` 表示不限 |
 | `BlockPublish` | `true` | 满队列时阻塞（`true`）还是立即拒绝 `ErrQueueFull` |
 | `PublishTimeout` | `0`（无限等待） | 阻塞发布的最长等待时间，超时返回 `ErrQueueFull` |
+| `ShutdownTimeout` | `5s` | `Shutdown` 默认排空窗口 |
+| `StopGrace` | `250ms` | 排空截止后等待在途 handler 返回的宽限 |
+| `Logger` | 标准 logger | 停机/投递/位点日志出口 |
 
 ### 消费组选项
 
@@ -150,6 +248,10 @@ busdata/
 | `ErrOffsetRejected` | 位点回退被拒绝（包装为 `*OffsetRegressionError`） |
 | `ErrDuplicateAck` | 同一消息被重复确认 |
 | `ErrOutOfOrderAck` | 确认会跳过尚未提交的消息 |
+| `ErrBusShuttingDown` | 优雅停机排空中拒绝新发布/订阅（同时匹配 `ErrBusClosed`） |
+| `ErrShutdownFenced` | 排空截止后的迟到提交/DLQ 写入被围栏拒绝；消息保持未确认，重启重投 |
+
+`*BusClosedError.Stage` 取值为 `"draining"` / `"closed"`，用于区分解雇阶段。停机报告见第 4.5 节，报告持久化在 `DataDir/shutdown.json`。
 
 ---
 
@@ -170,6 +272,37 @@ group=g partition=0 resume at offset=3   # 重启恢复点
 
 ---
 
-## 8. 适用边界
+## 9. 本地验证
+
+```bash
+# 全量用例（含新增停机用例），开启竞态检测
+go test ./... -race -v
+
+# 重点：有界队列打满 + 生产者等待 + 消费者重试 + 同时停机，多轮稳定性
+go test ./bus/ -race -run TestShutdownComboStress -count=10 -v
+
+# 其它停机用例：正常排空 / 超时围栏 / 错误可区分 / handler 卡死 / 窗口内 DLQ
+go test ./bus/ -race -run TestShutdown -v
+
+# 端到端示例（发布 -> 重试/DLQ -> “重启” -> 零重复）
+go run ./cmd/demo
+```
+
+停机相关用例与覆盖点：
+
+| 用例 | 覆盖 |
+|---|---|
+| `TestShutdownDrainsWithinWindow` | 窗口内全部收尾、报告 pending=0、重启零重投、报告与位点一致 |
+| `TestShutdownTimeoutFencesCommit` | 窗口不足时超时返回、迟到提交被围栏、未确认消息重启重投、原因 `drain_timeout` |
+| `TestShutdownRefusesNewWorkWithDistinctErrors` | 排空中 vs 关闭后错误可区分、阻塞生产者被唤醒、并发/重复停机幂等等待同一报告 |
+| `TestShutdownHandlerStuckReason` | handler 无视 ctx 卡到宽限结束：按时返回、原因 `handler_stuck`、释放后 Ack 被围栏 |
+| `TestShutdownDLQDuringDrain` | 窗口内进入 DLQ：持久化、位点推进、计入 `new_dlq`、重启不重投 |
+| `TestShutdownComboStress`（40 小轮） | 队列满 + 生产者等待 + 消费者重试 + 双发停机的组合；断言有界返回、无丢失、全生命周期恰好一次成功、位点不回退 |
+
+> 所有停机用例的日志（`-v` 输出）都带消息标识、分区、位点变化（如 `ACK-SUCCESS id=.. partition=.. offset=..`、`AFTER-RESTART id=.. offset=..`、`FENCED ... redelivery on restart`），便于复盘。
+
+---
+
+## 10. 适用边界
 
 这是一个**单进程、本地持久化**的实现，用于清晰展示消费组/位点/重试/DLQ/恢复的核心机制与可测试语义；不包含网络协议、多副本选举与跨节点协调。若业务处理可能产生副作用，请使 Handler 幂等（at-least-once 的标准要求）。
