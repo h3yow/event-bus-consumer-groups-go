@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -70,11 +71,15 @@ type Consumer struct {
 	stopOnce sync.Once
 	stopCh   chan struct{}
 	doneCh   chan struct{}
+	// started reports whether Run was ever called; Shutdown only waits
+	// for doneCh of started consumers.
+	started atomic.Bool
 }
 
 // Run starts one delivery loop per partition and blocks until Stop, ctx
 // cancellation or bus close.
 func (c *Consumer) Run(ctx context.Context) error {
+	c.started.Store(true)
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 

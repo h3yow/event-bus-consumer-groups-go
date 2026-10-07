@@ -25,7 +25,15 @@ type Config struct {
 	BlockPublish bool
 	// PublishTimeout bounds blocking publishes; zero means wait forever.
 	PublishTimeout time.Duration
+	// DrainTimeout bounds the graceful-shutdown drain window: how long
+	// Shutdown waits for in-flight, backing-off and unacknowledged messages
+	// to reach a terminal state before interrupting. <=0 uses the default
+	// (5s). Shutdown always finishes within this window plus a small grace.
+	DrainTimeout time.Duration
 }
+
+// DefaultDrainTimeout is the drain window used when Config.DrainTimeout <= 0.
+const DefaultDrainTimeout = 5 * time.Second
 
 // DefaultConfig returns sensible defaults.
 func DefaultConfig() Config {
@@ -34,6 +42,7 @@ func DefaultConfig() Config {
 		Partitions:    4,
 		QueueCapacity: 1024,
 		BlockPublish:  true,
+		DrainTimeout:  DefaultDrainTimeout,
 	}
 }
 
@@ -47,6 +56,12 @@ type Bus struct {
 	offsets    *OffsetStore
 	dlq        *DLQ
 	closed     bool
+	// draining is set when a graceful Shutdown begins: new publishes and
+	// subscriptions are rejected with ErrBusDraining while in-flight work
+	// drains. closed is set only when shutdown fully completes.
+	draining   bool
+	shutdownCh chan struct{} // closed when the first Shutdown finishes
+	report   *ShutdownReport
 	closeCh    chan struct{}
 	rrCounter  atomic.Uint64
 }
@@ -57,6 +72,9 @@ type Bus struct {
 func New(cfg Config) (*Bus, error) {
 	if cfg.Partitions <= 0 {
 		cfg.Partitions = 4
+	}
+	if cfg.DrainTimeout <= 0 {
+		cfg.DrainTimeout = DefaultDrainTimeout
 	}
 	if err := mkdir(cfg.DataDir); err != nil {
 		return nil, err
@@ -71,11 +89,12 @@ func New(cfg Config) (*Bus, error) {
 		return nil, err
 	}
 	b := &Bus{
-		cfg:     cfg,
-		groups:  map[string]*Consumer{},
-		offsets: offsets,
-		dlq:     dlq,
-		closeCh: make(chan struct{}),
+		cfg:        cfg,
+		groups:     map[string]*Consumer{},
+		offsets:    offsets,
+		dlq:        dlq,
+		shutdownCh: make(chan struct{}),
+		closeCh:    make(chan struct{}),
 	}
 	for i := 0; i < cfg.Partitions; i++ {
 		w, replay, err := OpenWAL(cfg.DataDir, i)
@@ -131,42 +150,63 @@ func (b *Bus) Publish(key, id string, payload []byte) (int, int64, error) {
 	p := b.partitions[part]
 	msg := Message{ID: id, Key: key, Payload: payload}
 
-	// blocking: park in WaitRoom until capacity frees.
-	if b.cfg.BlockPublish {
-		ctx := context.Background()
-		if b.cfg.PublishTimeout > 0 {
-			var cancel context.CancelFunc
-			ctx, cancel = context.WithTimeout(ctx, b.cfg.PublishTimeout)
-			defer cancel()
+	// Blocking publish may lose the capacity race: WaitRoom returns when
+	// capacity frees, but another producer can append first. In that case
+	// TryAppend reports ErrQueueFull and we park again instead of
+	// surfacing a spurious full-queue error.
+	for {
+		if b.cfg.BlockPublish {
+			if err := b.waitRoom(context.Background(), p); err != nil {
+				return 0, 0, err
+			}
 		}
-		ctx, cancel := context.WithCancel(ctx)
-		defer cancel()
-		go func() {
-			select {
-			case <-b.closeCh:
-				cancel()
-			case <-ctx.Done():
-			}
-		}()
-		if err := p.WaitRoom(ctx); err != nil {
-			b.mu.RLock()
-			closed := b.closed
-			b.mu.RUnlock()
-			if closed || errors.Is(err, ErrBusClosed) {
-				return 0, 0, ErrBusClosed
-			}
-			if b.cfg.PublishTimeout > 0 {
-				return 0, 0, ErrQueueFull
-			}
-			return 0, 0, err
+		stored, err := p.TryAppend(msg)
+		if err == nil {
+			return part, stored.Offset, nil
 		}
-	}
-
-	stored, err := p.TryAppend(msg)
-	if err != nil {
+		if errors.Is(err, ErrQueueFull) && b.cfg.BlockPublish {
+			continue
+		}
 		return 0, 0, err
 	}
-	return part, stored.Offset, nil
+}
+
+// waitRoom parks until the partition has capacity, mapping wake-up causes
+// to stable, distinguishable errors.
+func (b *Bus) waitRoom(ctx context.Context, p *PartitionLog) error {
+	if b.cfg.PublishTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, b.cfg.PublishTimeout)
+		defer cancel()
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		select {
+		case <-b.closeCh:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	err := p.WaitRoom(ctx)
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, ErrBusDraining) {
+		// Graceful shutdown started while we were parked: stable,
+		// distinguishable reason, never misreported as full.
+		return ErrBusDraining
+	}
+	b.mu.RLock()
+	closed := b.closed
+	b.mu.RUnlock()
+	if closed || errors.Is(err, ErrBusClosed) {
+		return ErrBusClosed
+	}
+	if b.cfg.PublishTimeout > 0 {
+		return ErrQueueFull
+	}
+	return err
 }
 
 // Subscribe registers a consumer group with the given handler and options.
@@ -177,6 +217,9 @@ func (b *Bus) Subscribe(groupID string, h Handler, opts ...ConsumerOption) (*Con
 	defer b.mu.Unlock()
 	if b.closed {
 		return nil, ErrBusClosed
+	}
+	if b.draining {
+		return nil, ErrBusDraining
 	}
 	if _, exists := b.groups[groupID]; exists {
 		return nil, &groupExistsError{group: groupID}
@@ -212,7 +255,8 @@ func (b *Bus) DLQEntries() ([]DLQEntry, error) { return b.dlq.Entries() }
 
 // Close stops accepting publishes, wakes all blocked publishers and
 // closes every storage handle. Consumers must be stopped separately
-// before Close to finish in-flight work.
+// before Close to finish in-flight work. Prefer Shutdown, which drains
+// in-flight work first; Close remains for compatibility and force-quit.
 func (b *Bus) Close() error {
 	b.mu.Lock()
 	if b.closed {
@@ -221,10 +265,13 @@ func (b *Bus) Close() error {
 	}
 	b.closed = true
 	close(b.closeCh)
+	b.mu.Unlock()
+	// Partition locks are taken WITHOUT b.mu held: append paths acquire
+	// p.mu and then b.mu.RLock (minCommitted), so the reverse order here
+	// could deadlock.
 	for _, p := range b.partitions {
 		p.close()
 	}
-	b.mu.Unlock()
 	return b.closeStorage()
 }
 

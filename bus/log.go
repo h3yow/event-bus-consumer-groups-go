@@ -102,6 +102,10 @@ type PartitionLog struct {
 	// waking blocked publishers/feeders (channel broadcast idiom).
 	signal chan struct{}
 	closed bool
+	// sealed rejects new appends and wakes blocked publishers with
+	// ErrBusDraining, while consumers keep reading (graceful shutdown
+	// drain phase). close still supersedes it at the end of shutdown.
+	sealed bool
 	wal    *WAL
 
 	// minCommitted reports the smallest "next offset" committed by any
@@ -155,18 +159,24 @@ func (p *PartitionLog) fullLocked() bool {
 }
 
 // WaitRoom blocks until the partition has capacity, ctx is cancelled or
-// the log is closed.
+// the log is closed. A sealed log (graceful shutdown) wakes waiters with
+// ErrBusDraining.
 func (p *PartitionLog) WaitRoom(ctx context.Context) error {
 	for {
 		p.mu.Lock()
-		full, closed := p.fullLocked(), p.closed
+		full, closed, sealed := p.fullLocked(), p.closed, p.sealed
 		ch := p.signal
 		p.mu.Unlock()
+		if closed {
+			// Checked before sealed: after shutdown completes the stable
+			// reason is ErrBusClosed, not the transitional ErrBusDraining.
+			return ErrBusClosed
+		}
+		if sealed {
+			return ErrBusDraining
+		}
 		if !full {
 			return nil
-		}
-		if closed {
-			return ErrBusClosed
 		}
 		select {
 		case <-ctx.Done():
@@ -202,13 +212,18 @@ func (p *PartitionLog) WaitOffset(ctx context.Context, offset int64) error {
 }
 
 // TryAppend persists the message to the WAL then makes it visible at the
-// next offset. Returns ErrQueueFull when the bounded queue is full and
-// ErrBusClosed after close.
+// next offset. Returns ErrQueueFull when the bounded queue is full,
+// ErrBusDraining when the log is sealed for shutdown and ErrBusClosed
+// after close.
 func (p *PartitionLog) TryAppend(m Message) (Message, error) {
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
 		return Message{}, ErrBusClosed
+	}
+	if p.sealed {
+		p.mu.Unlock()
+		return Message{}, ErrBusDraining
 	}
 	if p.fullLocked() {
 		p.mu.Unlock()
@@ -241,6 +256,20 @@ func (p *PartitionLog) Get(offset int64) (Message, bool) {
 		return Message{}, false
 	}
 	return p.records[offset], true
+}
+
+// seal stops accepting new records and wakes every blocked publisher with
+// ErrBusDraining. Consumers are unaffected: WaitOffset/Get keep working so
+// in-flight messages can drain. Idempotent.
+func (p *PartitionLog) seal() {
+	p.mu.Lock()
+	if !p.sealed {
+		p.sealed = true
+		ch := p.signal
+		p.signal = make(chan struct{})
+		close(ch)
+	}
+	p.mu.Unlock()
 }
 
 // close marks the log closed and wakes every waiter.

@@ -107,12 +107,18 @@ func main() {
 		return seenB.Load() >= total-1 && len(bDLQ) >= 1
 	}, 3*time.Second, "group-b consumes with one DLQ")
 
-	grpA.Stop()
-	grpB.Stop()
-	grpA.Wait()
-	grpB.Wait()
-	if err := b.Close(); err != nil {
+	// Unified graceful shutdown: stop accepting new messages, drain
+	// in-flight work within DrainTimeout, persist a shutdown report.
+	report, err := b.Shutdown(ctx)
+	if err != nil {
 		log.Fatal(err)
+	}
+	log.Printf("shutdown: outcome=%s reason=%q elapsed=%s", report.Outcome, report.Reason, report.Elapsed)
+	for _, g := range report.Groups {
+		for _, p := range g.Partitions {
+			log.Printf("  group=%s partition=%d committed_next=%d pending=%d dlq=%d",
+				g.GroupID, p.Partition, p.CommittedNext, p.Pending, g.DLQCount)
+		}
 	}
 	log.Printf("phase 1 done: group-b successes=%d DLQ=%d reason=%s lastErr=%q",
 		seenB.Load(), len(bDLQ), bDLQ[0].Reason, bDLQ[0].LastErr)

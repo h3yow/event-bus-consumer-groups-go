@@ -18,6 +18,11 @@ var (
 	ErrOutOfOrderAck = errors.New("bus: ack rejected: offset gap, earlier messages are not committed")
 	// ErrUnknownGroup is returned when a group has no subscription/state.
 	ErrUnknownGroup = errors.New("bus: unknown consumer group")
+	// ErrBusDraining is returned by Publish while a graceful Shutdown is in
+	// progress: new messages are no longer accepted, but already-published
+	// messages are still being drained. It is distinguishable from
+	// ErrBusClosed (shutdown fully completed) and ErrQueueFull (backpressure).
+	ErrBusDraining = errors.New("bus: shutdown in progress, not accepting new messages")
 )
 
 // RejectReason distinguishes why a message entered the dead-letter queue.
